@@ -1,0 +1,430 @@
+import React, { useState, useEffect } from 'react';
+import { Button } from "@/components/ui/button";
+import { MessageCircle, AlertCircle } from 'lucide-react';
+import { base44 } from '@/api/base44Client';
+import { createPageUrl } from '@/utils';
+import { toast } from 'sonner';
+
+import RoleReveal from '@/components/game/RoleReveal';
+import PolicyBoard from '@/components/game/PolicyBoard';
+import PlayerList from '@/components/game/PlayerList';
+import VotingPhase from '@/components/game/VotingPhase';
+import PolicySelection from '@/components/game/PolicySelection';
+import ExecutiveAction from '@/components/game/ExecutiveAction';
+import GameChat from '@/components/game/GameChat';
+import GameOver from '@/components/game/GameOver';
+import VoiceRecorder from '@/components/game/VoiceRecorder';
+
+export default function Game() {
+  const [game, setGame] = useState(null);
+  const [player, setPlayer] = useState(null);
+  const [room, setRoom] = useState(null);
+  const [showChat, setShowChat] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [showRoleReveal, setShowRoleReveal] = useState(true);
+
+  useEffect(() => {
+    loadGame();
+    
+    // Poll for updates
+    const interval = setInterval(loadGame, 2000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const loadGame = async () => {
+    const urlParams = new URLSearchParams(window.location.search);
+    const gameId = urlParams.get('gameId');
+    
+    if (!gameId) {
+      window.location.href = createPageUrl('Home');
+      return;
+    }
+
+    const user = await base44.auth.me();
+    const playerData = await base44.entities.Player.filter({ user_email: user.email });
+    
+    if (playerData.length > 0) {
+      setPlayer(playerData[0]);
+    }
+
+    const gameData = await base44.entities.Game.filter({ id: gameId });
+    
+    if (gameData.length === 0) {
+      toast.error('Game niet gevonden');
+      window.location.href = createPageUrl('Home');
+      return;
+    }
+
+    const currentGame = gameData[0];
+    setGame(currentGame);
+
+    // Load room
+    if (currentGame.room_id) {
+      const roomData = await base44.entities.Room.filter({ id: currentGame.room_id });
+      if (roomData.length > 0) {
+        setRoom(roomData[0]);
+      }
+    }
+
+    setIsLoading(false);
+  };
+
+  const handleRoleRevealComplete = async () => {
+    setShowRoleReveal(false);
+    
+    if (game.game_phase === 'role_reveal') {
+      await base44.entities.Game.update(game.id, {
+        game_phase: 'nomination'
+      });
+    }
+  };
+
+  const handleNominateChancellor = async (nominee) => {
+    const currentPlayer = game.players.find(p => p.email === player.user_email);
+    if (!currentPlayer?.is_president) return;
+
+    await base44.entities.Game.update(game.id, {
+      nominated_chancellor_email: nominee.email,
+      game_phase: 'voting',
+      votes: []
+    });
+  };
+
+  const handleVoteComplete = async () => {
+    const yesVotes = game.votes?.filter(v => v.vote).length || 0;
+    const noVotes = game.votes?.filter(v => !v.vote).length || 0;
+    const passed = yesVotes > noVotes;
+
+    if (passed) {
+      // Check tyrant win condition
+      if (game.collaborator_policies >= 3) {
+        const chancellor = game.players.find(p => p.email === game.nominated_chancellor_email);
+        if (chancellor?.role === 'tyrant') {
+          await base44.entities.Game.update(game.id, {
+            game_phase: 'game_over',
+            winner: 'collaborators',
+            win_reason: 'De Tiran is Kanselier geworden na 3+ collaborateurwetten!'
+          });
+          return;
+        }
+      }
+
+      // Draw 3 cards for president
+      let deck = [...game.policy_deck];
+      
+      // Reshuffle if needed
+      if (deck.length < 3) {
+        deck = [...deck, ...game.discard_pile].sort(() => Math.random() - 0.5);
+        await base44.entities.Game.update(game.id, { discard_pile: [] });
+      }
+      
+      const presidentCards = deck.splice(0, 3);
+      
+      // Update chancellor status
+      const updatedPlayers = game.players.map(p => ({
+        ...p,
+        is_chancellor: p.email === game.nominated_chancellor_email
+      }));
+
+      await base44.entities.Game.update(game.id, {
+        players: updatedPlayers,
+        policy_deck: deck,
+        president_cards: presidentCards,
+        game_phase: 'president_cards'
+      });
+    } else {
+      // Failed election
+      const newFailedElections = game.failed_elections + 1;
+      
+      if (newFailedElections >= 3) {
+        // Chaos! Top policy is enacted
+        let deck = [...game.policy_deck];
+        
+        if (deck.length < 1) {
+          deck = [...deck, ...game.discard_pile].sort(() => Math.random() - 0.5);
+        }
+        
+        const chaosCard = deck.shift();
+        const newLiberalCount = chaosCard === 'liberal' ? game.liberal_policies + 1 : game.liberal_policies;
+        const newCollaboratorCount = chaosCard === 'collaborator' ? game.collaborator_policies + 1 : game.collaborator_policies;
+        
+        let winner = 'none';
+        let winReason = '';
+        if (newLiberalCount >= 5) {
+          winner = 'liberals';
+          winReason = '5 liberale wetten aangenomen door chaos!';
+        } else if (newCollaboratorCount >= 6) {
+          winner = 'collaborators';
+          winReason = '6 collaborateurwetten aangenomen door chaos!';
+        }
+
+        // Reset term limits
+        const updatedPlayers = game.players.map(p => ({
+          ...p,
+          is_chancellor: false
+        }));
+
+        await base44.entities.Game.update(game.id, {
+          players: updatedPlayers,
+          policy_deck: deck,
+          failed_elections: 0,
+          liberal_policies: newLiberalCount,
+          collaborator_policies: newCollaboratorCount,
+          last_president_email: null,
+          last_chancellor_email: null,
+          game_phase: winner !== 'none' ? 'game_over' : 'nomination',
+          winner,
+          win_reason: winReason,
+          phase_data: { chaos: true, chaosCard }
+        });
+        
+        if (winner === 'none') {
+          // Move to next president after showing chaos
+          setTimeout(async () => {
+            await advanceToNextPresidentAfterChaos();
+          }, 3000);
+        }
+      } else {
+        await base44.entities.Game.update(game.id, {
+          failed_elections: newFailedElections,
+          nominated_chancellor_email: null,
+          votes: [],
+          phase_data: {}
+        });
+        
+        // Move to next president after brief delay
+        setTimeout(async () => {
+          await advanceToNextPresident();
+        }, 2000);
+      }
+    }
+  };
+
+  const advanceToNextPresident = async () => {
+    const currentPresidentIndex = game.current_president_index;
+    let nextPresidentIndex = (currentPresidentIndex + 1) % game.players.length;
+    
+    // Skip dead players
+    while (!game.players[nextPresidentIndex].is_alive) {
+      nextPresidentIndex = (nextPresidentIndex + 1) % game.players.length;
+    }
+
+    const updatedPlayers = game.players.map((p, i) => ({
+      ...p,
+      is_president: i === nextPresidentIndex,
+      is_chancellor: false
+    }));
+
+    await base44.entities.Game.update(game.id, {
+      players: updatedPlayers,
+      current_president_index: nextPresidentIndex,
+      game_phase: 'nomination',
+      nominated_chancellor_email: null,
+      votes: [],
+      failed_elections: 0,
+      phase_data: {}
+    });
+  };
+
+  const advanceToNextPresidentAfterChaos = async () => {
+    const currentPresidentIndex = game.current_president_index;
+    let nextPresidentIndex = (currentPresidentIndex + 1) % game.players.length;
+    
+    // Skip dead players
+    while (!game.players[nextPresidentIndex].is_alive) {
+      nextPresidentIndex = (nextPresidentIndex + 1) % game.players.length;
+    }
+
+    const updatedPlayers = game.players.map((p, i) => ({
+      ...p,
+      is_president: i === nextPresidentIndex,
+      is_chancellor: false
+    }));
+
+    await base44.entities.Game.update(game.id, {
+      players: updatedPlayers,
+      current_president_index: nextPresidentIndex,
+      game_phase: 'nomination',
+      nominated_chancellor_email: null,
+      votes: [],
+      phase_data: {}
+    });
+  };
+
+  if (isLoading || !game || !player) {
+    return (
+      <div className="min-h-screen bg-gradient-to-b from-[#0a0a0a] via-[#0f0f0f] to-[#0a0a0a] flex items-center justify-center">
+        <div className="w-8 h-8 border-2 border-amber-500 border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
+  }
+
+  const currentPlayer = game.players.find(p => p.email === player.user_email);
+  const president = game.players.find(p => p.is_president);
+  const isPresident = president?.email === player.user_email;
+  const isChancellor = game.players.find(p => p.is_chancellor)?.email === player.user_email;
+
+  return (
+    <div className="min-h-screen bg-[#050505] relative overflow-hidden">
+      {/* Mysterious background effects */}
+      <div className="absolute inset-0 bg-gradient-to-b from-amber-950/5 via-transparent to-red-950/5" />
+      <div className="absolute top-0 left-1/4 w-96 h-96 bg-amber-500/5 rounded-full blur-[120px] animate-pulse" />
+      <div className="absolute bottom-0 right-1/4 w-96 h-96 bg-red-500/5 rounded-full blur-[120px] animate-pulse" style={{animationDelay: '1s'}} />
+      <div className="absolute inset-0" style={{backgroundImage: 'radial-gradient(circle at 20% 50%, rgba(245,158,11,0.03) 0%, transparent 50%), radial-gradient(circle at 80% 50%, rgba(239,68,68,0.03) 0%, transparent 50%)'}} />
+      
+      {/* Role Reveal */}
+      {showRoleReveal && game.game_phase === 'role_reveal' && (
+        <RoleReveal 
+          player={player} 
+          game={game} 
+          onComplete={handleRoleRevealComplete}
+        />
+      )}
+
+      {/* Game Over */}
+      {game.game_phase === 'game_over' && (
+        <GameOver game={game} player={player} roomId={game.room_id} />
+      )}
+
+      <div className="relative z-10 max-w-2xl mx-auto px-4 py-6">
+        {/* Header */}
+        <div className="flex items-center justify-between mb-8">
+          <div className="backdrop-blur-xl bg-black/40 border border-white/5 rounded-2xl px-6 py-3 shadow-2xl">
+            <h1 className="text-xl font-bold text-white tracking-tight">{room?.room_name}</h1>
+            <p className="text-amber-500/60 text-xs font-medium mt-0.5">
+              Ronde {game.liberal_policies + game.collaborator_policies + 1}
+            </p>
+          </div>
+          
+          <div className="flex gap-2">
+            <VoiceRecorder roomId={game.room_id} player={player} />
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => setShowChat(true)}
+              className="text-gray-500 hover:text-amber-500 backdrop-blur-xl bg-black/40 border border-white/5 rounded-xl hover:shadow-lg hover:shadow-amber-500/20 transition-all"
+            >
+              <MessageCircle className="w-6 h-6" />
+            </Button>
+          </div>
+        </div>
+
+        {/* Policy Boards */}
+        <div className="mb-6">
+          <PolicyBoard 
+            liberalPolicies={game.liberal_policies} 
+            collaboratorPolicies={game.collaborator_policies} 
+          />
+        </div>
+
+        {/* Failed Elections Tracker */}
+        {game.failed_elections > 0 && (
+          <div className="bg-amber-500/10 border border-amber-500/20 rounded-xl p-3 mb-6 flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-amber-500" />
+            <span className="text-amber-500 text-sm">
+              Mislukte verkiezingen: {game.failed_elections}/3
+            </span>
+          </div>
+        )}
+
+        {/* Chaos Card */}
+        {game.phase_data?.chaos && (
+          <div className="bg-purple-500/10 border border-purple-500/30 rounded-xl p-4 mb-6 text-center">
+            <h3 className="text-purple-400 font-bold mb-2">Chaos!</h3>
+            <p className="text-gray-400 text-sm mb-2">3 mislukte verkiezingen - top kaart wordt direct gespeeld</p>
+            <div className={`w-12 h-16 mx-auto rounded-lg ${
+              game.phase_data.chaosCard === 'liberal' ? 'bg-blue-500' : 'bg-red-500'
+            } flex items-center justify-center`}>
+              <span className="text-white font-bold">
+                {game.phase_data.chaosCard === 'liberal' ? 'L' : 'C'}
+              </span>
+            </div>
+          </div>
+        )}
+
+        {/* Game Phase Content */}
+        {game.game_phase === 'nomination' && (
+          <div className="space-y-4">
+            <div className="text-center mb-4">
+              <h2 className="text-white font-bold">
+                {isPresident ? 'Kies een Kanselier' : `${president?.codename} kiest een Kanselier`}
+              </h2>
+              <p className="text-gray-400 text-sm">
+                {isPresident ? 'Selecteer een speler om te nomineren' : 'Wacht op de nominatie...'}
+              </p>
+            </div>
+            
+            <PlayerList
+              game={game}
+              currentPlayer={currentPlayer}
+              onSelectPlayer={isPresident ? handleNominateChancellor : undefined}
+              selectionMode={isPresident ? 'chancellor' : null}
+            />
+          </div>
+        )}
+
+        {game.game_phase === 'voting' && (
+          <VotingPhase 
+            game={game} 
+            player={player}
+            onVoteComplete={handleVoteComplete}
+          />
+        )}
+
+        {game.game_phase === 'president_cards' && (
+          <div>
+            {isPresident ? (
+              <PolicySelection game={game} player={player} isPresident={true} />
+            ) : (
+              <div className="text-center py-8">
+                <p className="text-gray-400">
+                  {president?.codename} bekijkt de wetskaarten...
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {game.game_phase === 'chancellor_cards' && (
+          <div>
+            {isChancellor ? (
+              <PolicySelection game={game} player={player} isPresident={false} />
+            ) : (
+              <div className="text-center py-8">
+                <p className="text-gray-400">
+                  De Kanselier kiest een wet...
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {game.game_phase === 'executive_action' && (
+          <ExecutiveAction game={game} player={player} />
+        )}
+
+        {game.game_phase === 'policy_enacted' && (
+          <div className="text-center py-8">
+            <p className="text-gray-400">Wet aangenomen. Volgende ronde begint...</p>
+          </div>
+        )}
+
+        {/* Player List (when not in selection mode) */}
+        {!['nomination', 'voting'].includes(game.game_phase) && game.game_phase !== 'game_over' && (
+          <div className="mt-6">
+            <h3 className="text-gray-400 text-sm mb-3">Spelers</h3>
+            <PlayerList game={game} currentPlayer={currentPlayer} />
+          </div>
+        )}
+      </div>
+
+      {/* Chat */}
+      <GameChat
+        roomId={game.room_id}
+        player={player}
+        isOpen={showChat}
+        onClose={() => setShowChat(false)}
+      />
+    </div>
+  );
+}
